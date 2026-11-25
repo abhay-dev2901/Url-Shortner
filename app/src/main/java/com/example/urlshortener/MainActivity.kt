@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.database.sqlite.SQLiteException
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -31,6 +32,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -52,60 +54,41 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.IOException
-import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URISyntaxException
-import java.net.URL
 
 private val Ink = Color(0xFF17233A)
 private val MutedInk = Color(0xFF65728A)
 private val Accent = Color(0xFF5267E8)
 private val Canvas = Color(0xFFF5F7FC)
 
+private data class ShorteningResult(val shortUrl: String, val savedCount: Int)
+
 class MainActivity : ComponentActivity() {
+    private val urlDatabase by lazy { UrlDatabase(applicationContext) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             LinkShortTheme {
                 LinkShortScreen(
                     onShorten = { url -> shortenUrl(url) },
+                    onLoadCount = {
+                        withContext(Dispatchers.IO) { urlDatabase.count() }
+                    },
                 )
             }
         }
     }
 
-    private suspend fun shortenUrl(url: String): String = withContext(Dispatchers.IO) {
-        val requestUrl = Uri.parse("https://is.gd/create.php")
-            .buildUpon()
-            .appendQueryParameter("format", "simple")
-            .appendQueryParameter("url", url)
-            .build()
-            .toString()
-        val connection = URL(requestUrl).openConnection() as HttpURLConnection
-
-        try {
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 15_000
-            connection.readTimeout = 15_000
-
-            val statusCode = connection.responseCode
-            val response = (if (statusCode in 200..299) {
-                connection.inputStream
-            } else {
-                connection.errorStream
-            })?.bufferedReader()?.use { it.readText().trim() }.orEmpty()
-
-            if (statusCode !in 200..299) {
-                throw IOException("The shortening service returned HTTP $statusCode.")
-            }
-            if (response.startsWith("Error:", ignoreCase = true) || response.isBlank()) {
-                throw IOException(response.ifBlank { "The shortening service returned an empty response." })
-            }
-
-            response
-        } finally {
-            connection.disconnect()
+    private suspend fun shortenUrl(url: String): ShorteningResult = withContext(Dispatchers.IO) {
+        val shortUrl = BitlyClient(BuildConfig.BITLY_ACCESS_TOKEN).shorten(url)
+        val savedCount = try {
+            urlDatabase.save(url, shortUrl)
+        } catch (exception: SQLiteException) {
+            throw IOException("The short link was created but could not be saved locally.", exception)
         }
+        ShorteningResult(shortUrl, savedCount)
     }
 }
 
@@ -124,13 +107,26 @@ private fun LinkShortTheme(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun LinkShortScreen(onShorten: suspend (String) -> String) {
+private fun LinkShortScreen(
+    onShorten: suspend (String) -> ShorteningResult,
+    onLoadCount: suspend () -> Int,
+) {
     val context = LocalContext.current
     var originalUrl by rememberSaveable { mutableStateOf("") }
     var shortUrl by rememberSaveable { mutableStateOf<String?>(null) }
     var errorMessage by rememberSaveable { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
+    var shortenedCount by remember { mutableStateOf<Int?>(null) }
+    var countLoadFailed by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        try {
+            shortenedCount = onLoadCount()
+        } catch (exception: SQLiteException) {
+            countLoadFailed = true
+        }
+    }
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -161,6 +157,16 @@ private fun LinkShortScreen(onShorten: suspend (String) -> String) {
             Text(
                 text = "Turn a long URL into a link that's easy to share.",
                 style = MaterialTheme.typography.bodyLarge,
+                color = MutedInk,
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = when {
+                    countLoadFailed -> "Saved URL count unavailable"
+                    shortenedCount == null -> "Loading saved URLs…"
+                    else -> "$shortenedCount URLs shortened"
+                },
+                style = MaterialTheme.typography.bodyMedium,
                 color = MutedInk,
             )
             Spacer(modifier = Modifier.height(32.dp))
@@ -205,7 +211,9 @@ private fun LinkShortScreen(onShorten: suspend (String) -> String) {
                                 shortUrl = null
                                 scope.launch {
                                     try {
-                                        shortUrl = onShorten(cleanedUrl)
+                                        val result = onShorten(cleanedUrl)
+                                        shortUrl = result.shortUrl
+                                        shortenedCount = result.savedCount
                                     } catch (exception: CancellationException) {
                                         throw exception
                                     } catch (exception: IOException) {
@@ -313,7 +321,7 @@ private fun LinkShortScreen(onShorten: suspend (String) -> String) {
 
             Spacer(modifier = Modifier.height(28.dp))
             Text(
-                text = "Free link shortening by is.gd",
+                text = "Link shortening by Bitly",
                 style = MaterialTheme.typography.bodySmall,
                 color = MutedInk,
             )
